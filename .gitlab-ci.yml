@@ -1,3 +1,12 @@
+default:
+  interruptible:                   true
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - unknown_failure
+      - api_failure
+
 stages:
   - lint
   - test
@@ -5,17 +14,13 @@ stages:
   - tag
   - publish
 
-variables:                         &default-vars
+variables:
   GIT_STRATEGY:                    fetch
   GIT_DEPTH:                       100
   CARGO_INCREMENTAL:               0
-  CARGO_TARGET_DIR:                "/ci-cache/${CI_PROJECT_NAME}/targets/${CI_COMMIT_REF_NAME}/${CI_JOB_NAME}"
   CI_IMAGE:                        "paritytech/ci-linux:production"
   CARGO_UNLEASH_INSTALL_PARAMS:    "--version 1.0.0-alpha.13"
   CARGO_UNLEASH_PKG_DEF:           ""
-  VAULT_SERVER_URL:                "https://vault.parity-mgmt-vault.parity.io"
-  VAULT_AUTH_PATH:                 "gitlab-parity-io-jwt"
-  VAULT_AUTH_ROLE:                 "cicd_gitlab_parity_${CI_PROJECT_NAME}"
 
 .publish-refs:                     &publish-refs
   rules:
@@ -25,52 +30,22 @@ variables:                         &default-vars
     - if: $CI_COMMIT_REF_NAME == "main"
     - if: $CI_COMMIT_REF_NAME =~ /^v[0-9]+\.[0-9]+.*$/              # i.e. v1.0, v2.1rc1
 
-#### Vault secrets
-.vault-secrets:                    &vault-secrets
-  secrets:
-    CRATES_TOKEN:
-      vault:                       cicd/gitlab/$CI_PROJECT_PATH/CRATES_TOKEN@kv
-      file:                        false
-    GITHUB_SSH_PRIV_KEY:
-      vault:                       cicd/gitlab/$CI_PROJECT_PATH/GITHUB_SSH_PRIV_KEY@kv
-      file:                        false
-    GITHUB_USER:
-      vault:                       cicd/gitlab/$CI_PROJECT_PATH/GITHUB_USER@kv
-      file:                        false
-
 .rust-info-script:                 &rust-info-script
   - rustup show
   - cargo --version
   - rustup +nightly show
   - cargo +nightly --version
   - bash --version
-  - sccache -s
 
 .docker-env:                       &docker-env
   image:                           "${CI_IMAGE}"
   before_script:
     - *rust-info-script
-    - ./scripts/ci/pre_cache.sh
-    - sccache -s
-  retry:
-    max: 2
-    when:
-      - runner_system_failure
-      - unknown_failure
-      - api_failure
-  interruptible:                   true
   tags:
-    - linux-docker
+    - linux-docker-vm-c2
 
 .kubernetes-env:                   &kubernetes-env
   image:                           "${CI_IMAGE}"
-  retry:
-    max: 2
-    when:
-      - runner_system_failure
-      - unknown_failure
-      - api_failure
-  interruptible:                   true
   tags:
     - kubernetes-parity-build
 
@@ -78,7 +53,7 @@ variables:                         &default-vars
   artifacts:
     name:                          "${CI_JOB_NAME}_${CI_COMMIT_REF_NAME}"
     when:                          on_success
-    expire_in:                     28 days
+    expire_in:                     7 days
     paths:
       - ./artifacts/
 
@@ -86,7 +61,7 @@ variables:                         &default-vars
 
 fmt:
   stage:                           lint
-  <<:                              *kubernetes-env
+  <<:                              *docker-env
   script:
     - cargo +nightly fmt --all -- --check
 
@@ -94,7 +69,7 @@ clippy:
   stage:                           lint
   <<:                              *docker-env
   script:
-    - cargo +nightly clippy --all --verbose
+    - cargo clippy --all --verbose
 
 #### stage:                       test
 
@@ -103,7 +78,7 @@ deny:
   <<:                              *docker-env
   <<:                              *collect-artifacts
   script:
-    - cargo deny check --hide-inclusion-graph -c .maintain/deny.toml
+    - cargo deny check --hide-inclusion-graph -c scripts/ci/deny.toml
   after_script:
     - mkdir -p ./artifacts
     - echo "___Complete logs can be found in the artifacts___"
@@ -130,7 +105,6 @@ build:
 tag-job:
   stage: tag
   <<:                              *kubernetes-env
-  <<:                              *vault-secrets
   <<:                              *publish-refs
   script:
     #FIXME: remove after ssh added to base image
@@ -168,7 +142,6 @@ tag-job:
 unleash-to-crates-io:
   stage:                           publish
   <<:                              *docker-env
-  <<:                              *vault-secrets
   <<:                              *publish-refs
   script:
     - echo $TAG
@@ -179,4 +152,41 @@ unleash-to-crates-io:
         cargo unleash em-dragons --no-check --owner github:paritytech:core-devs ${CARGO_UNLEASH_PKG_DEF};
       else
         echo "Tag was not updated. Not releasing.";
+      fi
+
+publish-npmjs:
+  stage:                           publish
+  <<:                              *kubernetes-env
+  <<:                              *publish-refs
+  variables:
+    CI_IMAGE:                      "node:16"
+  script:
+    - echo $TAG
+    - if [ $TAG == "new"  ];
+      then
+        echo "------------Publishing to npmjs------------";
+        npm install;
+        npm run build;
+        cd npm_dist/;
+        echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > .npmrc;
+        npm publish --access public;
+        cd ..;
+        echo "------------Configuring git------------";
+        eval $(ssh-agent);
+        ssh-add - <<< ${GITHUB_SSH_PRIV_KEY};
+        mkdir ~/.ssh && touch ~/.ssh/known_hosts;
+        ssh-keyscan -t rsa github.com >> ~/.ssh/known_hosts;
+        git config user.name "${GITHUB_USER}";
+        git config user.email "devops-team@parity.io";
+        git config remote.origin.url "git@github.com:/paritytech/${CI_PROJECT_NAME}.git";
+        git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*";
+        echo "------------Pushing package.json and package-lock.json to github------------";
+        git branch tmp;
+        git checkout main || git checkout master;
+        git add package.json;
+        git add package-lock.json;
+        git commit -m "[skip ci] Update package.json and package-lock.json";
+        git push;
+      else
+        echo "Tag was not updated. Not publishing.";
       fi
